@@ -46,11 +46,18 @@ type Producer struct {
 	StopChan   chan struct{}
 }
 
-// NewProducer creates a new producer
-func NewProducer(id int, config Config, conn *amqp.Connection) (*Producer, error) {
+// NewProducer creates a new producer with its own connection
+func NewProducer(id int, config Config) (*Producer, error) {
+	// Create a new connection for each producer
+	conn, err := amqp.Dial(config.RabbitMQURL)
+	if err != nil {
+		return nil, fmt.Errorf("producer %d failed to connect to RabbitMQ: %w", id, err)
+	}
+
 	ch, err := conn.Channel()
 	if err != nil {
-		return nil, fmt.Errorf("failed to open channel: %w", err)
+		conn.Close()
+		return nil, fmt.Errorf("producer %d failed to open channel: %w", id, err)
 	}
 
 	return &Producer{
@@ -69,6 +76,7 @@ func NewProducer(id int, config Config, conn *amqp.Connection) (*Producer, error
 func (p *Producer) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer p.Channel.Close()
+	defer p.Connection.Close() // Close the connection when done
 
 	log.Printf("Producer %d starting", p.ID)
 
@@ -203,6 +211,23 @@ func (p *Producer) GetStats() Stats {
 	}
 }
 
+// AsyncProducerCreator holds the result of async producer creation
+type AsyncProducerCreator struct {
+	Producer *Producer
+	Error    error
+	Index    int
+}
+
+// CreateProducerAsync creates a new producer asynchronously
+func CreateProducerAsync(id int, config Config, resultChan chan<- AsyncProducerCreator) {
+	producer, err := NewProducer(id, config)
+	resultChan <- AsyncProducerCreator{
+		Producer: producer,
+		Error:    err,
+		Index:    id,
+	}
+}
+
 func main() {
 	numProducers := flag.Int("producers", 1, "Number of producer goroutines")
 	mps := flag.Int("mps", 10, "Messages per second per producer")
@@ -244,14 +269,6 @@ func main() {
 		RoutingKey:        rKey,
 	}
 
-	// Connect to RabbitMQ
-	log.Printf("Connecting to RabbitMQ at %s:%d (user: %s)", config.Host, config.Port, config.Username)
-	conn, err := amqp.Dial(config.RabbitMQURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
-	}
-	defer conn.Close()
-
 	// Setup context for graceful shutdown
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -276,23 +293,36 @@ func main() {
 
 	totalMPS := config.NumberOfProducers * config.MessagesPerSecond
 	bytesPerSec := totalMPS * 512 // Each message is exactly 512 bytes
-	log.Printf("Starting %d producers, each sending %d messages/sec (512 bytes each)",
+	log.Printf("Starting %d producers (with individual connections), each sending %d messages/sec (512 bytes each)",
 		config.NumberOfProducers, config.MessagesPerSecond)
 	log.Printf("Total throughput: %d messages/sec (%.2f MB/sec)",
 		totalMPS, float64(bytesPerSec)/(1024*1024))
 
+	// Create producers asynchronously
+	resultChan := make(chan AsyncProducerCreator, config.NumberOfProducers)
+	for i := 0; i < config.NumberOfProducers; i++ {
+		go CreateProducerAsync(i, config, resultChan)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Collect results and start producers
 	producers := make([]*Producer, config.NumberOfProducers)
 	var wg sync.WaitGroup
+	var startTime time.Time = time.Now()
 
 	for i := 0; i < config.NumberOfProducers; i++ {
-		producer, err := NewProducer(i, config, conn)
-		if err != nil {
-			log.Fatalf("Failed to create producer %d: %v", i, err)
+		result := <-resultChan
+		if result.Error != nil {
+			log.Printf("Failed to create producer %d: %v", result.Index, result.Error)
+			continue
 		}
 
-		producers[i] = producer
+		producers[result.Index] = result.Producer
+		log.Printf("Producer %d created in %.2f ms", result.Index,
+			float64(time.Since(startTime).Microseconds())/1000.0)
+
 		wg.Add(1)
-		go producer.Start(ctx, &wg)
+		go result.Producer.Start(ctx, &wg)
 	}
 
 	go func() {
@@ -342,3 +372,4 @@ func main() {
 	log.Printf("Total errors: %d", totalErrors)
 	log.Printf("Total runtime: %.2f seconds", elapsedSecs)
 }
+

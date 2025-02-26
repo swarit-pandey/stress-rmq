@@ -46,18 +46,50 @@ type Producer struct {
 	StopChan   chan struct{}
 }
 
-// NewProducer creates a new producer with its own connection
+// NewProducer creates a new producer with its own connection and implements retry logic
 func NewProducer(id int, config Config) (*Producer, error) {
-	// Create a new connection for each producer
-	conn, err := amqp.Dial(config.RabbitMQURL)
-	if err != nil {
-		return nil, fmt.Errorf("producer %d failed to connect to RabbitMQ: %w", id, err)
-	}
+	var conn *amqp.Connection
+	var ch *amqp.Channel
+	var err error
 
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("producer %d failed to open channel: %w", id, err)
+	// Retry configuration
+	maxRetries := 5
+	retryDelay := 2 * time.Second
+
+	// Try to connect with retries
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Create a new connection for each producer
+		conn, err = amqp.Dial(config.RabbitMQURL)
+		if err == nil {
+			// Connection successful, try to open a channel
+			ch, err = conn.Channel()
+			if err == nil {
+				// Success - we have both connection and channel
+				break
+			}
+			// Close the connection if we couldn't open a channel
+			conn.Close()
+			log.Printf("Producer %d: Failed to open channel (attempt %d/%d): %v",
+				id, attempt, maxRetries, err)
+		} else {
+			log.Printf("Producer %d: Failed to connect to RabbitMQ (attempt %d/%d): %v",
+				id, attempt, maxRetries, err)
+		}
+
+		// Check if we've reached the maximum number of retries
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("producer %d: failed to connect after %d attempts: %w",
+				id, maxRetries, err)
+		}
+
+		// Wait before retrying, with some randomness to avoid stampede
+		jitter := time.Duration(50 * time.Millisecond)
+		retryTime := retryDelay + jitter
+		log.Printf("Producer %d: Retrying in %.2f seconds...", id, retryTime.Seconds())
+		time.Sleep(retryTime)
+
+		// Increase delay for next retry (exponential backoff)
+		retryDelay = retryDelay * 2
 	}
 
 	return &Producer{
@@ -75,50 +107,21 @@ func NewProducer(id int, config Config) (*Producer, error) {
 // Start begins publishing messages at the configured rate
 func (p *Producer) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer p.Channel.Close()
-	defer p.Connection.Close() // Close the connection when done
+	defer func() {
+		if p.Channel != nil {
+			p.Channel.Close()
+		}
+		if p.Connection != nil {
+			p.Connection.Close()
+		}
+	}()
 
 	log.Printf("Producer %d starting", p.ID)
 
-	_, err := p.Channel.QueueDeclare(
-		p.Config.QueueName, // name
-		true,               // durable
-		false,              // delete when unused
-		false,              // exclusive
-		false,              // no-wait
-		nil,                // arguments
-	)
-	if err != nil {
-		log.Printf("Producer %d: Failed to declare queue: %v", p.ID, err)
+	// Configure queue and exchange
+	if err := p.setupTopology(); err != nil {
+		log.Printf("Producer %d: Failed to setup topology: %v", p.ID, err)
 		return
-	}
-
-	if p.Config.Exchange != "" {
-		err = p.Channel.ExchangeDeclare(
-			p.Config.Exchange, // name
-			"direct",          // type
-			true,              // durable
-			false,             // auto-deleted
-			false,             // internal
-			false,             // no-wait
-			nil,               // arguments
-		)
-		if err != nil {
-			log.Printf("Producer %d: Failed to declare exchange: %v", p.ID, err)
-			return
-		}
-
-		err = p.Channel.QueueBind(
-			p.Config.QueueName,  // queue name
-			p.Config.RoutingKey, // routing key
-			p.Config.Exchange,   // exchange
-			false,
-			nil,
-		)
-		if err != nil {
-			log.Printf("Producer %d: Failed to bind queue: %v", p.ID, err)
-			return
-		}
 	}
 
 	// Create a 512-byte message
@@ -163,24 +166,19 @@ func (p *Producer) Start(ctx context.Context, wg *sync.WaitGroup) {
 				message[12+i] = byte(ts >> (i * 8))
 			}
 
-			err := p.Channel.PublishWithContext(
-				ctx,
-				p.Config.Exchange,   // exchange
-				p.Config.RoutingKey, // routing key
-				false,               // mandatory
-				false,               // immediate
-				amqp.Publishing{
-					ContentType:  "application/octet-stream",
-					DeliveryMode: amqp.Persistent,
-					MessageId:    fmt.Sprintf("%d-%d", p.ID, msgCount),
-					Body:         message,
-				},
-			)
-
+			err := p.publish(ctx, message, msgCount)
 			if err != nil {
 				atomic.AddUint64(&p.Stats.Errors, 1)
 				log.Printf("Producer %d: Failed to publish message: %v", p.ID, err)
-				time.Sleep(time.Second) // Avoid flooding logs on error
+
+				// Attempt to reconnect
+				if err = p.reconnect(); err != nil {
+					log.Printf("Producer %d: Failed to reconnect: %v", p.ID, err)
+					time.Sleep(time.Second) // Avoid flooding logs on error
+					continue
+				}
+
+				// Try again after reconnecting
 				continue
 			}
 
@@ -195,6 +193,131 @@ func (p *Producer) Start(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		}
 	}
+}
+
+// setupTopology sets up the RabbitMQ queues and exchanges
+func (p *Producer) setupTopology() error {
+	_, err := p.Channel.QueueDeclare(
+		p.Config.QueueName, // name
+		true,               // durable
+		false,              // delete when unused
+		false,              // exclusive
+		false,              // no-wait
+		nil,                // arguments
+	)
+	if err != nil {
+		return fmt.Errorf("failed to declare queue: %w", err)
+	}
+
+	if p.Config.Exchange != "" {
+		err = p.Channel.ExchangeDeclare(
+			p.Config.Exchange, // name
+			"direct",          // type
+			true,              // durable
+			false,             // auto-deleted
+			false,             // internal
+			false,             // no-wait
+			nil,               // arguments
+		)
+		if err != nil {
+			return fmt.Errorf("failed to declare exchange: %w", err)
+		}
+
+		err = p.Channel.QueueBind(
+			p.Config.QueueName,  // queue name
+			p.Config.RoutingKey, // routing key
+			p.Config.Exchange,   // exchange
+			false,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to bind queue: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// publish sends a message to RabbitMQ
+func (p *Producer) publish(ctx context.Context, message []byte, msgCount uint64) error {
+	return p.Channel.PublishWithContext(
+		ctx,
+		p.Config.Exchange,   // exchange
+		p.Config.RoutingKey, // routing key
+		false,               // mandatory
+		false,               // immediate
+		amqp.Publishing{
+			ContentType:  "application/octet-stream",
+			DeliveryMode: amqp.Persistent,
+			MessageId:    fmt.Sprintf("%d-%d", p.ID, msgCount),
+			Body:         message,
+		},
+	)
+}
+
+// reconnect attempts to restore the RabbitMQ connection and channel
+func (p *Producer) reconnect() error {
+	// Close existing connections
+	if p.Channel != nil {
+		p.Channel.Close()
+	}
+	if p.Connection != nil {
+		p.Connection.Close()
+	}
+
+	// Retry configuration
+	maxRetries := 3
+	retryDelay := time.Second
+
+	var err error
+	// Try to reconnect with retries
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Producer %d: Attempting to reconnect (attempt %d/%d)...", p.ID, attempt, maxRetries)
+
+		connName := fmt.Sprintf("custom-name-%d-%d", p.ID, time.Now().UnixNano())
+		cfg := amqp.Config{
+			Properties: amqp.Table{
+				"connection_name": connName,
+			},
+		}
+
+		// Create a new connection
+		p.Connection, err = amqp.DialConfig(p.Config.RabbitMQURL, cfg)
+		if err != nil {
+			log.Printf("Producer %d: Failed to reconnect (attempt %d/%d): %v",
+				p.ID, attempt, maxRetries, err)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+			continue
+		}
+
+		// Create a new channel
+		p.Channel, err = p.Connection.Channel()
+		if err != nil {
+			log.Printf("Producer %d: Reconnected but failed to create channel (attempt %d/%d): %v",
+				p.ID, attempt, maxRetries, err)
+			p.Connection.Close()
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+			continue
+		}
+
+		// Re-setup topology
+		if err = p.setupTopology(); err != nil {
+			log.Printf("Producer %d: Reconnected but failed to setup topology (attempt %d/%d): %v",
+				p.ID, attempt, maxRetries, err)
+			p.Channel.Close()
+			p.Connection.Close()
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+			continue
+		}
+
+		log.Printf("Producer %d: Successfully reconnected!", p.ID)
+		return nil
+	}
+
+	return fmt.Errorf("failed to reconnect after %d attempts", maxRetries)
 }
 
 // Stop signals the producer to stop

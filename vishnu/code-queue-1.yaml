@@ -1,0 +1,25 @@
+kmux:
+  source:
+    stream: rabbitmq
+
+rabbitmq:
+  server: idt.app.accuknox.com:5671
+  username: default_user_-EGUcJ537xsaqxWQzxH
+  password: HJXGP31XvPcy6PLKnrLi7oFCCWJ3XKjs
+  exchange:
+    name: idt-prod 
+    type: direct
+    durable: true
+    auto-delete: true
+  queue:
+    name: code-queue-1
+    durable: true
+    auto-delete: true
+  debug: true
+  channel:
+    globalPrefetch: false
+  consumer-tag: receiver
+  tls: 
+    enabled: true
+    cert-file: cert.pem
+    skip-verify: false

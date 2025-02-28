@@ -1,0 +1,29 @@
+kmux:
+  source:
+    stream: rabbitmq
+
+rabbitmq:
+  server: {{.Server}}
+  {{- if .User }}
+  username: {{.User}}
+  {{- end }}
+  {{- if .Password }}
+  password: {{.Password}}
+  {{- end }}
+  exchange:
+    name: {{.ExchangeName}} 
+    type: {{.ExchangeType}}
+    durable: true
+    auto-delete: true
+  queue:
+    name: {{.QueueName}}
+    durable: true
+    auto-delete: true
+  debug: true
+  channel:
+    globalPrefetch: false
+  consumer-tag: receiver
+  tls: 
+    enabled: {{.TLSEnabled}}
+    cert-file: {{.CertFile}}
+    skip-verify: false

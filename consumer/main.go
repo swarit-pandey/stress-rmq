@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -25,6 +29,12 @@ type Config struct {
 	Password          string
 	RabbitMQURL       string
 	QueueName         string
+	ExchangeName      string
+	RoutingKey        string
+	CertFile          string
+	EnableTLS         bool
+	DumpJSON          bool
+	JSONOutputFile    string
 }
 
 // Stats tracks performance metrics
@@ -33,18 +43,34 @@ type Stats struct {
 	StartTime        time.Time
 }
 
+// MessageData represents a message received from RabbitMQ
+type MessageData struct {
+	Body         string                 `json:"body"`
+	DeliveryTag  uint64                 `json:"delivery_tag"`
+	ConsumerTag  string                 `json:"consumer_tag"`
+	MessageCount uint32                 `json:"message_count,omitempty"`
+	Exchange     string                 `json:"exchange"`
+	RoutingKey   string                 `json:"routing_key"`
+	Timestamp    time.Time              `json:"timestamp,omitempty"`
+	Headers      map[string]interface{} `json:"headers,omitempty"`
+	ContentType  string                 `json:"content_type,omitempty"`
+	ConsumerID   int                    `json:"consumer_id"`
+	ReceivedAt   time.Time              `json:"received_at"`
+}
+
 // Consumer represents a message consumer
 type Consumer struct {
-	ID         int
-	Config     Config
-	Connection *amqp.Connection
-	Channel    *amqp.Channel
-	Stats      Stats
-	StopChan   chan struct{}
+	ID           int
+	Config       Config
+	Connection   *amqp.Connection
+	Channel      *amqp.Channel
+	Stats        Stats
+	StopChan     chan struct{}
+	MessagesChan chan MessageData
 }
 
 // NewConsumer creates a new consumer
-func NewConsumer(id int, config Config, conn *amqp.Connection) (*Consumer, error) {
+func NewConsumer(id int, config Config, conn *amqp.Connection, messagesChan chan MessageData) (*Consumer, error) {
 	ch, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open channel: %w", err)
@@ -68,7 +94,8 @@ func NewConsumer(id int, config Config, conn *amqp.Connection) (*Consumer, error
 		Stats: Stats{
 			StartTime: time.Now(),
 		},
-		StopChan: make(chan struct{}),
+		StopChan:     make(chan struct{}),
+		MessagesChan: messagesChan,
 	}, nil
 }
 
@@ -79,7 +106,25 @@ func (c *Consumer) Start(ctx context.Context, wg *sync.WaitGroup) {
 
 	log.Printf("Consumer %d starting", c.ID)
 
-	_, err := c.Channel.QueueDeclare(
+	// Declare the exchange if specified
+	if c.Config.ExchangeName != "" {
+		err := c.Channel.ExchangeDeclare(
+			c.Config.ExchangeName, // name
+			"direct",               // type (default to topic, can be customized if needed)
+			true,                  // durable
+			true,                 // auto-deleted
+			false,                 // internal
+			false,                 // no-wait
+			nil,                   // arguments
+		)
+		if err != nil {
+			log.Printf("Consumer %d: Failed to declare exchange: %v", c.ID, err)
+			return
+		}
+	}
+
+	// Declare the queue
+	q, err := c.Channel.QueueDeclare(
 		c.Config.QueueName, // name
 		true,               // durable
 		false,              // delete when unused
@@ -90,6 +135,21 @@ func (c *Consumer) Start(ctx context.Context, wg *sync.WaitGroup) {
 	if err != nil {
 		log.Printf("Consumer %d: Failed to declare queue: %v", c.ID, err)
 		return
+	}
+
+	// Bind the queue to the exchange with routing key if both are specified
+	if c.Config.ExchangeName != "" && c.Config.RoutingKey != "" {
+		err = c.Channel.QueueBind(
+			q.Name,                // queue name
+			c.Config.RoutingKey,   // routing key
+			c.Config.ExchangeName, // exchange
+			false,
+			nil,
+		)
+		if err != nil {
+			log.Printf("Consumer %d: Failed to bind queue: %v", c.ID, err)
+			return
+		}
 	}
 
 	deliveries, err := c.Channel.Consume(
@@ -126,13 +186,47 @@ func (c *Consumer) Start(ctx context.Context, wg *sync.WaitGroup) {
 			log.Printf("Consumer %d: Received %d messages (%.2f msgs/sec)",
 				c.ID, msgCount, rate)
 
-		case _, ok := <-deliveries:
+		case d, ok := <-deliveries:
 			if !ok {
 				log.Printf("Consumer %d: Channel closed", c.ID)
 				return
 			}
 
 			atomic.AddUint64(&c.Stats.MessagesReceived, 1)
+
+			// If JSON dumping is enabled, send message data to the channel
+			if c.Config.DumpJSON {
+				// Extract headers
+				headers := make(map[string]interface{})
+				if d.Headers != nil {
+					for k, v := range d.Headers {
+						headers[k] = v
+					}
+				}
+
+				msgData := MessageData{
+					Body:         string(d.Body),
+					DeliveryTag:  d.DeliveryTag,
+					ConsumerTag:  d.ConsumerTag,
+					MessageCount: d.MessageCount,
+					Exchange:     d.Exchange,
+					RoutingKey:   d.RoutingKey,
+					Timestamp:    d.Timestamp,
+					Headers:      headers,
+					ContentType:  d.ContentType,
+					ConsumerID:   c.ID,
+					ReceivedAt:   time.Now(),
+				}
+
+				// Non-blocking send to the messages channel
+				select {
+				case c.MessagesChan <- msgData:
+					// Successfully sent
+				default:
+					// Channel buffer is full, dropping this message
+					log.Printf("Consumer %d: Message buffer full, dropping message", c.ID)
+				}
+			}
 		}
 	}
 }
@@ -148,6 +242,62 @@ func (c *Consumer) GetStats() Stats {
 	}
 }
 
+// JSONDumper listens for messages and writes them to a JSON file
+func JSONDumper(ctx context.Context, wg *sync.WaitGroup, messagesChan chan MessageData, outputFile string) {
+	defer wg.Done()
+
+	log.Printf("JSON dumper starting, output file: %s", outputFile)
+
+	file, err := os.Create(outputFile)
+	if err != nil {
+		log.Fatalf("Failed to create JSON output file: %v", err)
+	}
+	defer file.Close()
+
+	// Write the opening bracket for the JSON array
+	file.WriteString("[\n")
+
+	var messageCount int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Write the closing bracket for the JSON array
+			file.WriteString("\n]")
+			log.Printf("JSON dumper shutting down, wrote %d messages", messageCount)
+			return
+
+		case msg, ok := <-messagesChan:
+			if !ok {
+				// Channel was closed
+				file.WriteString("\n]")
+				log.Printf("JSON dumper shutting down (channel closed), wrote %d messages", messageCount)
+				return
+			}
+
+			// Add comma for all messages except the first one
+			if messageCount > 0 {
+				file.WriteString(",\n")
+			}
+
+			// Convert message to JSON and write to file
+			jsonData, err := json.MarshalIndent(msg, "  ", "  ")
+			if err != nil {
+				log.Printf("Failed to marshal message to JSON: %v", err)
+				continue
+			}
+
+			_, err = file.Write(jsonData)
+			if err != nil {
+				log.Printf("Failed to write message to file: %v", err)
+				continue
+			}
+
+			messageCount++
+		}
+	}
+}
+
 func main() {
 	numConsumers := flag.Int("consumers", 1, "Number of consumer goroutines")
 	prefetch := flag.Int("prefetch", 100, "Prefetch count per consumer")
@@ -160,30 +310,89 @@ func main() {
 	vhost := flag.String("vhost", "/", "RabbitMQ virtual host")
 
 	queueName := flag.String("queue", "messages", "Queue name to consume from")
+	exchangeName := flag.String("exchange", "", "Exchange name (if empty, won't bind to an exchange)")
+	routingKey := flag.String("routing-key", "#", "Routing key for binding queue to exchange")
+
+	enableTLS := flag.Bool("tls", false, "Enable TLS connection")
+	certFile := flag.String("cert", "", "Path to TLS certificate file (PEM format)")
+
+	dumpJSON := flag.Bool("json", false, "Dump messages to JSON file")
+	jsonFile := flag.String("json-file", "messages.json", "Output JSON file path")
+
 	durationSec := flag.Int("duration", 0, "Duration in seconds (0 means run until interrupted)")
 	flag.Parse()
-
-	connectionURL := *rabbitURL
-	if connectionURL == "" {
-		connectionURL = fmt.Sprintf("amqp://%s:%s@%s:%d%s",
-			*username, *password, *host, *port, *vhost)
-	}
 
 	config := Config{
 		NumberOfConsumers: *numConsumers,
 		PrefetchCount:     *prefetch,
-		RabbitMQURL:       connectionURL,
 		Host:              *host,
 		Port:              *port,
 		Username:          *username,
 		Password:          *password,
 		QueueName:         *queueName,
+		ExchangeName:      *exchangeName,
+		RoutingKey:        *routingKey,
+		EnableTLS:         *enableTLS,
+		CertFile:          *certFile,
+		DumpJSON:          *dumpJSON,
+		JSONOutputFile:    *jsonFile,
 	}
 
+	// Build connection URL
+	var conn *amqp.Connection
+	var err error
+
 	log.Printf("Connecting to RabbitMQ at %s:%d (user: %s)", config.Host, config.Port, config.Username)
-	conn, err := amqp.Dial(config.RabbitMQURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+
+	if config.EnableTLS {
+		if config.CertFile == "" {
+			log.Fatalf("TLS enabled but no certificate file provided")
+		}
+
+		log.Printf("TLS enabled, using certificate: %s", config.CertFile)
+
+		// Read the certificate file
+		cert, err := ioutil.ReadFile(config.CertFile)
+		if err != nil {
+			log.Fatalf("Failed to read TLS certificate file: %v", err)
+		}
+
+		// Create a certificate pool and add the certificate
+		certPool := x509.NewCertPool()
+		if ok := certPool.AppendCertsFromPEM(cert); !ok {
+			log.Fatalf("Failed to parse certificate")
+		}
+
+		// Create TLS config with the certificate
+		tlsConfig := &tls.Config{
+			RootCAs: certPool,
+		}
+
+		// Use the AMQPS protocol for TLS
+		connectionURL := *rabbitURL
+		if connectionURL == "" {
+			connectionURL = fmt.Sprintf("amqps://%s:%s@%s:%d%s",
+				*username, *password, *host, *port, *vhost)
+		}
+
+		// Connect with TLS config
+		conn, err = amqp.DialTLS(connectionURL, tlsConfig)
+		if err != nil {
+			log.Fatalf("Failed to connect to RabbitMQ with TLS: %v", err)
+		}
+	} else {
+		// Use standard AMQP protocol without TLS
+		connectionURL := *rabbitURL
+		if connectionURL == "" {
+			connectionURL = fmt.Sprintf("amqp://%s:%s@%s:%d%s",
+				*username, *password, *host, *port, *vhost)
+		}
+
+		config.RabbitMQURL = connectionURL
+		conn, err = amqp.Dial(config.RabbitMQURL)
+		if err != nil {
+			log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		}
 	}
 	defer conn.Close()
 
@@ -208,14 +417,32 @@ func main() {
 	}
 	defer cancel()
 
+	// Create a channel for message data if JSON dumping is enabled
+	var messagesChan chan MessageData
+	if config.DumpJSON {
+		messagesChan = make(chan MessageData, 10000) // Buffer up to 10K messages
+	}
+
 	log.Printf("Starting %d consumers with prefetch count %d from queue '%s'",
 		config.NumberOfConsumers, config.PrefetchCount, config.QueueName)
+
+	if config.ExchangeName != "" {
+		log.Printf("Will bind queue '%s' to exchange '%s' with routing key '%s'",
+			config.QueueName, config.ExchangeName, config.RoutingKey)
+	}
 
 	consumers := make([]*Consumer, config.NumberOfConsumers)
 	var wg sync.WaitGroup
 
+	// Start the JSON dumper if enabled
+	if config.DumpJSON {
+		log.Printf("JSON dumping enabled, messages will be written to: %s", config.JSONOutputFile)
+		wg.Add(1)
+		go JSONDumper(ctx, &wg, messagesChan, config.JSONOutputFile)
+	}
+
 	for i := 0; i < config.NumberOfConsumers; i++ {
-		consumer, err := NewConsumer(i, config, conn)
+		consumer, err := NewConsumer(i, config, conn, messagesChan)
 		if err != nil {
 			log.Fatalf("Failed to create consumer %d: %v", i, err)
 		}
@@ -254,6 +481,11 @@ func main() {
 
 	wg.Wait()
 
+	// Close message channel if it exists
+	if messagesChan != nil {
+		close(messagesChan)
+	}
+
 	var totalMessages uint64
 	for _, c := range consumers {
 		stats := c.GetStats()
@@ -269,3 +501,4 @@ func main() {
 	log.Printf("Average rate: %.2f messages/sec (%.2f MB/sec)", overallRate, mbPerSec)
 	log.Printf("Total runtime: %.2f seconds", elapsedSecs)
 }
+

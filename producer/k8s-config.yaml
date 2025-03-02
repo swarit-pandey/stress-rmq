@@ -1,29 +1,24 @@
-# ConfigMap for RabbitMQ Producer configuration
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rabbitmq-producer-config
 data:
-  # Configuration values matching your command
-  RABBITMQ_HOST: "34.66.104.2"  # Your specific RabbitMQ host
-  RABBITMQ_PORT: "30764"        # Your specific RabbitMQ port
+  RABBITMQ_HOST: "34.66.104.2"  
+  RABBITMQ_PORT: "30764"        
   RABBITMQ_VHOST: "/"
   QUEUE_NAME: "messages"
   EXCHANGE: ""
   ROUTING_KEY: ""
 ---
-# Secret for RabbitMQ credentials
 apiVersion: v1
 kind: Secret
 metadata:
   name: rabbitmq-producer-secret
 type: Opaque
 data:
-  # Base64 encoded values of your specific credentials
-  RABBITMQ_USERNAME: ZGVmYXVsdF91c2VyX3RxSmYxQnpOZDNFbkpYQWtablc=  # "default_user_tqJf1BzNd3EnJXAkZnW"
-  RABBITMQ_PASSWORD: bmRBZ2laaDg1Wk1jNU5IYk5sU1NnU2JaY0ZPcTZlOXY=  # "ndAgiZh85ZMc5NHbNlSSgSbZcFOq6e9v"
+  RABBITMQ_USERNAME: "" 
+  RABBITMQ_PASSWORD: ""
 ---
-# Deployment for RabbitMQ Producer
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,7 +26,7 @@ metadata:
   labels:
     app: rabbitmq-producer
 spec:
-  replicas: 1  # Adjust based on your needs
+  replicas: 1 
   selector:
     matchLabels:
       app: rabbitmq-producer
@@ -49,25 +44,23 @@ spec:
               - key: kubernetes.io/hostname
                 operator: NotIn
                 values:
-                - gke-swarit-cluster-ng-4-8-78dd99fc-0ljk  # Avoid scheduling on the RabbitMQ server node
+                - gke-swarit-cluster-ng-4-8-78dd99fc-0ljk
       containers:
       - name: rabbitmq-producer
-        image: sprectza/stress-rmq-producer:v1  # Replace with your image repository
+        image: sprectza/stress-rmq-producer:v1
         imagePullPolicy: IfNotPresent
         command:
         - /app/rabbitmq-producer
         args:
-        - "-producers=1000"                     # 1000 producer goroutines as per your command
-        - "-mps=1"                              # 1 message per second per producer as per your command
-        - "-host=$(RABBITMQ_HOST)"              # RabbitMQ host from env var
-        - "-port=$(RABBITMQ_PORT)"              # RabbitMQ port from env var
-        - "-username=$(RABBITMQ_USERNAME)"      # RabbitMQ username from env var
-        - "-password=$(RABBITMQ_PASSWORD)"      # RabbitMQ password from env var
-        - "-vhost=$(RABBITMQ_VHOST)"            # RabbitMQ vhost from env var
-        - "-queue=$(QUEUE_NAME)"                # Queue name from env var
-        - "-exchange=$(EXCHANGE)"               # Exchange name from env var
-        - "-routing-key=$(ROUTING_KEY)"         # Routing key from env var
-        - "-duration=0"                         # Run indefinitely
+        - "-producers=1000"                     
+        - "-mps=1"                              
+        - "-host=$(RABBITMQ_HOST)"              
+        - "-port=$(RABBITMQ_PORT)"              
+        - "-username=$(RABBITMQ_USERNAME)"      
+        - "-password=$(RABBITMQ_PASSWORD)"      
+        - "-queue=$(QUEUE_NAME)"                
+        - "-routing-key=$(ROUTING_KEY)"         
+        - "-duration=0"                         
         env:
         - name: RABBITMQ_HOST
           valueFrom:
@@ -111,11 +104,11 @@ spec:
               key: RABBITMQ_PASSWORD
         resources:
           requests:
-            cpu: "250m"     # Further reduced CPU request to 250 millicore
-            memory: "250Mi"  # Further reduced memory request to 250MB
+            cpu: "250m"
+            memory: "250Mi"
           limits:
-            cpu: "500m"     # Reduced CPU limit accordingly
-            memory: "500Mi"  # Reduced memory limit accordingly
+            cpu: "500m"
+            memory: "500Mi"
         livenessProbe:
           exec:
             command:
@@ -123,23 +116,22 @@ spec:
             - "rabbitmq-producer"
           initialDelaySeconds: 5
           periodSeconds: 10
----
-# HorizontalPodAutoscaler (optional)
-# apiVersion: autoscaling/v2
-# kind: HorizontalPodAutoscaler
-# metadata:
-#   name: rabbitmq-producer-hpa
-# spec:
-#   scaleTargetRef:
-#     apiVersion: apps/v1
-#     kind: Deployment
-#     name: rabbitmq-producer
-#   minReplicas: 1
-#   maxReplicas: 10
-#   metrics:
-#   - type: Resource
-#     resource:
-#       name: cpu
-#       target:
-#         type: Utilization
-#         averageUtilization: 70
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

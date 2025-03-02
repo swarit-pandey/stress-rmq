@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -110,9 +109,9 @@ func (c *Consumer) Start(ctx context.Context, wg *sync.WaitGroup) {
 	if c.Config.ExchangeName != "" {
 		err := c.Channel.ExchangeDeclare(
 			c.Config.ExchangeName, // name
-			"direct",               // type (default to topic, can be customized if needed)
+			"direct",              // type (default to topic, can be customized if needed)
 			true,                  // durable
-			true,                 // auto-deleted
+			true,                  // auto-deleted
 			false,                 // internal
 			false,                 // no-wait
 			nil,                   // arguments
@@ -352,7 +351,7 @@ func main() {
 		log.Printf("TLS enabled, using certificate: %s", config.CertFile)
 
 		// Read the certificate file
-		cert, err := ioutil.ReadFile(config.CertFile)
+		cert, err := os.ReadFile(config.CertFile)
 		if err != nil {
 			log.Fatalf("Failed to read TLS certificate file: %v", err)
 		}
@@ -444,7 +443,8 @@ func main() {
 	for i := 0; i < config.NumberOfConsumers; i++ {
 		consumer, err := NewConsumer(i, config, conn, messagesChan)
 		if err != nil {
-			log.Fatalf("Failed to create consumer %d: %v", i, err)
+			log.Print("Failed to create consumer: %w", err)
+			continue
 		}
 
 		consumers[i] = consumer
@@ -501,4 +501,3 @@ func main() {
 	log.Printf("Average rate: %.2f messages/sec (%.2f MB/sec)", overallRate, mbPerSec)
 	log.Printf("Total runtime: %.2f seconds", elapsedSecs)
 }
-
